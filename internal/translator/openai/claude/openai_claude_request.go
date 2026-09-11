@@ -44,6 +44,11 @@ func convertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
 	}
 
+	// Session identifier -> user (lets upstreams scope per-session state)
+	if uid := root.Get("metadata.user_id"); uid.Exists() {
+		out, _ = sjson.SetBytes(out, "user", uid.String())
+	}
+
 	// Temperature
 	if temp := root.Get("temperature"); temp.Exists() {
 		out, _ = sjson.SetBytes(out, "temperature", temp.Float())
