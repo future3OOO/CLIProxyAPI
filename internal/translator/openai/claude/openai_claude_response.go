@@ -58,6 +58,10 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	ThinkingContentBlockIndex int
 	// Next available content block index
 	NextContentBlockIndex int
+	// StreamDetermined caches the per-request "stream" check so it is not
+	// re-scanned from the full request body on every SSE frame.
+	StreamDetermined bool
+	IsStreaming      bool
 }
 
 // ToolCallAccumulator holds the state for accumulating tool call data
@@ -68,6 +72,9 @@ type ToolCallAccumulator struct {
 	// StartEmitted tracks whether content_block_start has already been sent
 	// for this tool index.
 	StartEmitted bool
+	// ArgsEmittedLen tracks how much of Arguments has been streamed to the
+	// client as input_json_delta fragments.
+	ArgsEmittedLen int
 }
 
 // ConvertOpenAIResponseToClaude converts OpenAI streaming response format to Anthropic API format.
@@ -118,12 +125,16 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
 
-	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
-	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
-		return convertOpenAINonStreamingToAnthropic(rawJSON)
-	} else {
-		return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+	p := (*param).(*ConvertOpenAIResponseToAnthropicParams)
+	if !p.StreamDetermined {
+		streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
+		p.IsStreaming = streamResult.Exists() && streamResult.Type != gjson.False
+		p.StreamDetermined = true
 	}
+	if !p.IsStreaming {
+		return convertOpenAINonStreamingToAnthropic(rawJSON)
+	}
+	return convertOpenAIStreamingChunkToAnthropic(rawJSON, p)
 }
 
 func effectiveOpenAIFinishReason(param *ConvertOpenAIResponseToAnthropicParams) string {
@@ -261,6 +272,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 						argsText := args.String()
 						if argsText != "" {
 							accumulator.Arguments.WriteString(argsText)
+							emitToolArgsDelta(param, index, accumulator, &results)
 						}
 					}
 				}
@@ -270,6 +282,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				// separate deltas.
 				if !accumulator.StartEmitted && accumulator.Name != "" && accumulator.ID != "" && !param.ContentBlocksStopped {
 					emitToolUseStart(param, index, accumulator, &results)
+					emitToolArgsDelta(param, index, accumulator, &results)
 				}
 
 				return true
@@ -314,7 +327,11 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 				if accumulator.Arguments.Len() > 0 {
 					inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
 					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
+					payload := accumulator.Arguments.String()[accumulator.ArgsEmittedLen:]
+					if accumulator.ArgsEmittedLen == 0 {
+						payload = util.FixJSON(accumulator.Arguments.String())
+					}
+					inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", payload)
 					results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
 				}
 
@@ -380,7 +397,11 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 			if accumulator.Arguments.Len() > 0 {
 				inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
 				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", blockIndex)
-				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", util.FixJSON(accumulator.Arguments.String()))
+				payload := accumulator.Arguments.String()[accumulator.ArgsEmittedLen:]
+				if accumulator.ArgsEmittedLen == 0 {
+					payload = util.FixJSON(accumulator.Arguments.String())
+				}
+				inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", payload)
 				results = append(results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
 			}
 
@@ -579,6 +600,26 @@ func emitToolUseStart(param *ConvertOpenAIResponseToAnthropicParams, openAIToolI
 	*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "content_block_start", contentBlockStartJSON, 2))
 	accumulator.StartEmitted = true
 	param.SawToolCall = true
+}
+
+// emitToolArgsDelta streams any not-yet-sent argument text as an
+// input_json_delta fragment instead of holding the whole blob until
+// finish_reason. Fragments are raw text — the client concatenates them into
+// the full JSON. FixJSON repair is preserved for the never-streamed
+// whole-blob case at finish time.
+func emitToolArgsDelta(param *ConvertOpenAIResponseToAnthropicParams, openAIToolIndex int, accumulator *ToolCallAccumulator, results *[][]byte) {
+	if !accumulator.StartEmitted || param.ContentBlocksStopped {
+		return
+	}
+	full := accumulator.Arguments.String()
+	if accumulator.ArgsEmittedLen >= len(full) {
+		return
+	}
+	inputDeltaJSON := []byte(`{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`)
+	inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "index", param.toolContentBlockIndex(openAIToolIndex))
+	inputDeltaJSON, _ = sjson.SetBytes(inputDeltaJSON, "delta.partial_json", full[accumulator.ArgsEmittedLen:])
+	*results = append(*results, translatorcommon.AppendSSEEventBytes(nil, "content_block_delta", inputDeltaJSON, 2))
+	accumulator.ArgsEmittedLen = len(full)
 }
 
 // emitBelatedToolUseStart finalizes a tool_use block that never received a

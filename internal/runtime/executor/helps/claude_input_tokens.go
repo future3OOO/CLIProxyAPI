@@ -29,6 +29,15 @@ type ClaudeInputTokenState struct {
 	originalRequest []byte
 	codec           tokenizer.Codec
 	handled         bool
+	// estimateCh carries the precomputed input-token count, started at request
+	// setup so the full-request BPE pass overlaps the upstream call instead of
+	// blocking the first client byte.
+	estimateCh chan claudeInputEstimate
+}
+
+type claudeInputEstimate struct {
+	count int64
+	err   error
 }
 
 // NewClaudeInputTokenState creates request-scoped state for translated Claude input token usage.
@@ -36,12 +45,20 @@ func NewClaudeInputTokenState(sourceFormat, upstreamFormat, responseFormat sdktr
 	enabled := sourceFormat == sdktranslator.FormatClaude &&
 		upstreamFormat != sdktranslator.FormatClaude &&
 		responseFormat == sdktranslator.FormatClaude
-	return &ClaudeInputTokenState{
+	state := &ClaudeInputTokenState{
 		upstreamFormat:  upstreamFormat,
 		responseFormat:  responseFormat,
 		originalRequest: originalRequest,
 		handled:         !enabled,
 	}
+	if enabled {
+		state.estimateCh = make(chan claudeInputEstimate, 1)
+		go func() {
+			count, err := state.estimate()
+			state.estimateCh <- claudeInputEstimate{count: count, err: err}
+		}()
+	}
+	return state
 }
 
 // TranslateStreamWithClaudeInputTokens translates a stream chunk and estimates Claude message_start input usage once.
@@ -327,11 +344,12 @@ func (state *ClaudeInputTokenState) applyChunk(ctx context.Context, chunk []byte
 				if inputTokens.Exists() && inputTokens.Int() != 0 {
 					return chunk, true
 				}
-				count, err := state.estimate()
-				if err != nil {
-					state.logEstimateError(ctx, err)
+				est := <-state.estimateCh
+				if est.err != nil {
+					state.logEstimateError(ctx, est.err)
 					return chunk, true
 				}
+				count := est.count
 				if count == 0 {
 					return chunk, true
 				}
