@@ -382,6 +382,12 @@ func (state *ClaudeInputTokenState) applyChunk(ctx context.Context, chunk []byte
 				if inputTokens.Exists() && inputTokens.Int() != 0 {
 					return chunk, true
 				}
+				// A nonzero cache_read means upstream accounted this request;
+				// its input_tokens=0 is real, not missing — patching it would
+				// double-count the cached prefix in consumers that sum both.
+				if gjson.GetBytes(payload, usagePath+".cache_read_input_tokens").Int() != 0 {
+					return chunk, true
+				}
 				if !state.estimateReady && terminalUsage {
 					// Earlier events already went out unpatched, so wait for the
 					// in-flight estimate instead of dropping the correction.

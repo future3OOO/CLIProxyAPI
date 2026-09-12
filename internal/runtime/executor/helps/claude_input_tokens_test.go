@@ -382,6 +382,57 @@ func TestClaudeInputTokenStateDoesNotBlockMessageStartOnPendingEstimate(t *testi
 	}
 }
 
+// A usage event carrying cache_read_input_tokens is accounted usage: its
+// input_tokens=0 is real, not missing. The estimate must not overwrite it, or
+// consumers summing input_tokens + cache_read_input_tokens double-count the
+// cached prefix. Deterministic twin of the executor-seam test, which forces
+// the pending path with a large request and fails loudly if the estimate
+// resolves before message_start.
+func TestClaudeInputTokenStateKeepsCacheReadDeltaUnpatched(t *testing.T) {
+	gate := make(chan struct{})
+	state := newClaudeInputTokenState(
+		sdktranslator.FormatClaude,
+		sdktranslator.FormatOpenAI,
+		sdktranslator.FormatClaude,
+		[]byte(`{"messages":[{"role":"user","content":"Hello."}]}`),
+		gatedClaudeInputCodec{gate: gate, count: 4242},
+	)
+	close(gate)
+
+	got := state.apply(context.Background(), [][]byte{[]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":15,\"cache_read_input_tokens\":6476}}\n\n")})
+	if tokens := eventUsageInputTokens(got, "usage.input_tokens"); tokens != 0 {
+		t.Fatalf("delta input_tokens equals the estimate instead of 0: got %d", tokens)
+	}
+	if cached := eventUsageInputTokens(got, "usage.cache_read_input_tokens"); cached != 6476 {
+		t.Fatalf("usage.cache_read_input_tokens = %d, want preserved 6476", cached)
+	}
+}
+
+// The cache-read early return precedes the terminal-usage wait, so a cancelled
+// context cannot delay or alter a cached delta: the pending estimate is left
+// unresolved and the accounted usage returns verbatim.
+func TestClaudeInputTokenStateKeepsCacheReadDeltaUnpatchedOnCancel(t *testing.T) {
+	gate := make(chan struct{})
+	t.Cleanup(func() { close(gate) })
+	state := newClaudeInputTokenState(
+		sdktranslator.FormatClaude,
+		sdktranslator.FormatOpenAI,
+		sdktranslator.FormatClaude,
+		[]byte(`{"messages":[{"role":"user","content":"Hello."}]}`),
+		gatedClaudeInputCodec{gate: gate, count: 4242},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	got := state.apply(ctx, [][]byte{[]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":15,\"cache_read_input_tokens\":6476}}\n\n")})
+	if tokens := eventUsageInputTokens(got, "usage.input_tokens"); tokens != 0 {
+		t.Fatalf("cancelled cached delta input_tokens = %d, want unpatched 0", tokens)
+	}
+	if cached := eventUsageInputTokens(got, "usage.cache_read_input_tokens"); cached != 6476 {
+		t.Fatalf("usage.cache_read_input_tokens = %d, want preserved 6476", cached)
+	}
+}
+
 func TestClaudeInputTokenStateAppliesPendingEstimateToLaterUsageEvent(t *testing.T) {
 	gate := make(chan struct{})
 	state := newClaudeInputTokenState(
