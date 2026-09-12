@@ -411,6 +411,32 @@ func TestClaudeInputTokenStateKeepsCacheReadDeltaUnpatched(t *testing.T) {
 	}
 }
 
+// cache_creation is the same accounted-usage shape: a write-only turn reports
+// input_tokens=0 with cache_creation_input_tokens>0, and the estimate must not
+// overwrite that real zero either.
+func TestClaudeInputTokenStateKeepsCacheCreationDeltaUnpatched(t *testing.T) {
+	gate := make(chan struct{})
+	state := newClaudeInputTokenState(
+		sdktranslator.FormatClaude,
+		sdktranslator.FormatOpenAI,
+		sdktranslator.FormatClaude,
+		[]byte(`{"messages":[{"role":"user","content":"Hello."}]}`),
+		gatedClaudeInputCodec{gate: gate, count: 4242},
+	)
+	close(gate)
+
+	got := state.apply(context.Background(), [][]byte{[]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":15,\"cache_creation_input_tokens\":3200}}\n\n")})
+	if !eventUsageFieldExists(got, "usage.input_tokens") {
+		t.Fatal("usage.input_tokens field missing; want preserved real zero")
+	}
+	if tokens := eventUsageInputTokens(got, "usage.input_tokens"); tokens != 0 {
+		t.Fatalf("delta input_tokens equals the estimate instead of 0: got %d", tokens)
+	}
+	if created := eventUsageInputTokens(got, "usage.cache_creation_input_tokens"); created != 3200 {
+		t.Fatalf("usage.cache_creation_input_tokens = %d, want preserved 3200", created)
+	}
+}
+
 // The cache-read early return precedes the terminal-usage wait, so a cancelled
 // context cannot delay or alter a cached delta: the pending estimate is left
 // unresolved and the accounted usage returns verbatim.
