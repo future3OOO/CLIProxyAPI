@@ -67,6 +67,10 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	UsageOutputTokens     int64
 	UsageCachedTokens     int64
 	UsageCacheWriteTokens int64
+	// StreamDetermined caches the per-request "stream" check so it is not
+	// re-scanned from the full request body on every SSE frame.
+	StreamDetermined bool
+	IsStreaming      bool
 }
 
 // InterleavedContentChunk stores a buffered chunk of text or thinking arriving while a tool call is open
@@ -139,12 +143,16 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
 
-	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
-	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
-		return convertOpenAINonStreamingToAnthropic(rawJSON)
-	} else {
-		return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+	p := (*param).(*ConvertOpenAIResponseToAnthropicParams)
+	if !p.StreamDetermined {
+		streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
+		p.IsStreaming = streamResult.Exists() && streamResult.Type != gjson.False
+		p.StreamDetermined = true
 	}
+	if !p.IsStreaming {
+		return convertOpenAINonStreamingToAnthropic(rawJSON)
+	}
+	return convertOpenAIStreamingChunkToAnthropic(rawJSON, p)
 }
 
 func effectiveOpenAIFinishReason(param *ConvertOpenAIResponseToAnthropicParams) string {

@@ -44,6 +44,11 @@ func convertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
 	}
 
+	// Session identifier -> user (lets upstreams scope per-session state)
+	if uid := root.Get("metadata.user_id"); uid.Exists() {
+		out, _ = sjson.SetBytes(out, "user", uid.String())
+	}
+
 	// Temperature
 	if temp := root.Get("temperature"); temp.Exists() {
 		out, _ = sjson.SetBytes(out, "temperature", temp.Float())
@@ -390,7 +395,9 @@ func convertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	}
 
 	// Handle user parameter (for tracking)
-	if user := root.Get("user"); user.Exists() {
+	// A top-level user applies only when no session identifier was forwarded;
+	// metadata.user_id carries the session id used for per-session state.
+	if user := root.Get("user"); user.Exists() && root.Get("metadata.user_id").String() == "" {
 		out, _ = sjson.SetBytes(out, "user", user.String())
 	}
 
