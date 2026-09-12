@@ -400,6 +400,9 @@ func TestClaudeInputTokenStateKeepsCacheReadDeltaUnpatched(t *testing.T) {
 	close(gate)
 
 	got := state.apply(context.Background(), [][]byte{[]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":15,\"cache_read_input_tokens\":6476}}\n\n")})
+	if !eventUsageFieldExists(got, "usage.input_tokens") {
+		t.Fatal("usage.input_tokens field missing; want preserved real zero")
+	}
 	if tokens := eventUsageInputTokens(got, "usage.input_tokens"); tokens != 0 {
 		t.Fatalf("delta input_tokens equals the estimate instead of 0: got %d", tokens)
 	}
@@ -425,6 +428,9 @@ func TestClaudeInputTokenStateKeepsCacheReadDeltaUnpatchedOnCancel(t *testing.T)
 	cancel()
 
 	got := state.apply(ctx, [][]byte{[]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":15,\"cache_read_input_tokens\":6476}}\n\n")})
+	if !eventUsageFieldExists(got, "usage.input_tokens") {
+		t.Fatal("usage.input_tokens field missing; want preserved real zero")
+	}
 	if tokens := eventUsageInputTokens(got, "usage.input_tokens"); tokens != 0 {
 		t.Fatalf("cancelled cached delta input_tokens = %d, want unpatched 0", tokens)
 	}
@@ -653,6 +659,22 @@ func eventUsageInputTokens(chunks [][]byte, usagePath string) int64 {
 		}
 	}
 	return 0
+}
+
+func eventUsageFieldExists(chunks [][]byte, usagePath string) bool {
+	for _, chunk := range chunks {
+		for _, line := range strings.Split(string(chunk), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if gjson.Get(payload, usagePath).Exists() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func messageStartInputTokens(chunks [][]byte) int64 {

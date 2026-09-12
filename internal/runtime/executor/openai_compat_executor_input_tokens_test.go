@@ -152,7 +152,8 @@ func TestOpenAICompatExecutorClaudeInputTokensDoneFirstStream(t *testing.T) {
 // double-counts the cached prefix.
 //
 // The request is deliberately large so the real tokenizer estimate stays
-// pending through the localhost upstream round trip. The unpatched
+// pending through the localhost upstream round trip: measured ~450ms for the
+// ~9MB payload versus a sub-millisecond local round trip. The unpatched
 // message_start assertion proves the pending path was taken — if the estimate
 // ever resolved before message_start, that assertion fails instead of letting
 // the test pass without exercising the guard.
@@ -171,7 +172,7 @@ func TestOpenAICompatExecutorClaudeInputTokensKeepsCacheReadDelta(t *testing.T) 
 		"api_key":  "test",
 	}}
 
-	largeContent := strings.Repeat("the quick brown fox jumps over the lazy dog. ", 40000)
+	largeContent := strings.Repeat("the quick brown fox jumps over the lazy dog. ", 200000)
 	claudeRequest := []byte(fmt.Sprintf(
 		`{"model":"compatible-model","stream":true,"messages":[{"role":"user","content":%q}]}`,
 		largeContent,
@@ -214,7 +215,9 @@ func TestOpenAICompatExecutorClaudeInputTokensKeepsCacheReadDelta(t *testing.T) 
 			if cached := gjson.Get(payload, "usage.cache_read_input_tokens"); cached.Int() != 6476 {
 				t.Fatalf("cache_read_input_tokens lost: got %v\n%q", cached.Value(), body)
 			}
-			if tokens := gjson.Get(payload, "usage.input_tokens"); tokens.Int() != 0 {
+			if tokens := gjson.Get(payload, "usage.input_tokens"); !tokens.Exists() {
+				t.Fatalf("delta input_tokens field missing; want preserved real zero: %q", body)
+			} else if tokens.Int() != 0 {
 				t.Fatalf("delta input_tokens equals the estimate instead of 0: got %v\n%q", tokens.Value(), body)
 			}
 		}
