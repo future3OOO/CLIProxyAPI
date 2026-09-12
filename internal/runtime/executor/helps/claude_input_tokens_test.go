@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -206,6 +207,7 @@ func TestTranslateStreamWithClaudeInputTokensPatchesMessageStartOnce(t *testing.
 
 	originalRequest := []byte(`{"system":"System text.","messages":[{"role":"user","content":"Hello."}]}`)
 	state := NewClaudeInputTokenState(sdktranslator.FormatClaude, upstreamFormat, sdktranslator.FormatClaude, originalRequest)
+	drainClaudeInputEstimate(t, state)
 	var param any
 	combined := []byte("event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n" +
 		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0}\n\n")
@@ -254,6 +256,7 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":0}}}
 func TestClaudeInputTokenStatePreservesCRLFAndNonTargetEvents(t *testing.T) {
 	originalRequest := []byte(`{"messages":[{"role":"user","content":"Hello."}]}`)
 	state := NewClaudeInputTokenState(sdktranslator.FormatClaude, sdktranslator.FormatOpenAI, sdktranslator.FormatClaude, originalRequest)
+	drainClaudeInputEstimate(t, state)
 	chunk := []byte("event: message_start\r\ndata:  {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}  \r\n\r\n" +
 		"event: ping\r\ndata: {\"type\":\"ping\",\"value\":\"keep\"}\r\n\r\n")
 
@@ -274,6 +277,7 @@ func TestClaudeInputTokenStatePatchesMissingAndPreservesNonZero(t *testing.T) {
 
 	t.Run("missing", func(t *testing.T) {
 		state := NewClaudeInputTokenState(sdktranslator.FormatClaude, sdktranslator.FormatOpenAI, sdktranslator.FormatClaude, originalRequest)
+		drainClaudeInputEstimate(t, state)
 		chunks := [][]byte{[]byte("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"output_tokens\":0}}}\n\n")}
 		got := state.apply(context.Background(), chunks)
 		if tokens := messageStartInputTokens(got); tokens <= 0 {
@@ -322,18 +326,168 @@ func TestClaudeInputTokenStateSkipsUnsupportedFlows(t *testing.T) {
 	}
 }
 
+type gatedClaudeInputCodec struct {
+	gate    <-chan struct{}
+	started chan<- struct{}
+	count   int
+	err     error
+}
+
+func (gatedClaudeInputCodec) GetName() string {
+	return "gated"
+}
+
+func (c gatedClaudeInputCodec) Count(string) (int, error) {
+	if c.started != nil {
+		close(c.started)
+	}
+	<-c.gate
+	return c.count, c.err
+}
+
+func (gatedClaudeInputCodec) Encode(string) ([]uint, []string, error) {
+	return nil, nil, errors.New("encode unimplemented")
+}
+
+func (gatedClaudeInputCodec) Decode([]uint) (string, error) {
+	return "", errors.New("decode unimplemented")
+}
+
+func TestClaudeInputTokenStateDoesNotBlockMessageStartOnPendingEstimate(t *testing.T) {
+	gate := make(chan struct{})
+	t.Cleanup(func() { close(gate) })
+	state := newClaudeInputTokenState(
+		sdktranslator.FormatClaude,
+		sdktranslator.FormatOpenAI,
+		sdktranslator.FormatClaude,
+		[]byte(`{"messages":[{"role":"user","content":"Hello."}]}`),
+		gatedClaudeInputCodec{gate: gate, count: 4242},
+	)
+	chunks := [][]byte{[]byte("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0}}}\n\n")}
+
+	done := make(chan [][]byte, 1)
+	go func() {
+		done <- state.apply(context.Background(), chunks)
+	}()
+	select {
+	case got := <-done:
+		if tokens := messageStartInputTokens(got); tokens != 0 {
+			t.Fatalf("message_start input_tokens = %d, want unpatched 0 while estimate pending", tokens)
+		}
+		if state.handled {
+			t.Fatal("state.handled = true, want false while estimate pending")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("apply blocked on pending estimate; first chunk must not wait for tokenization")
+	}
+}
+
+func TestClaudeInputTokenStateAppliesPendingEstimateToLaterUsageEvent(t *testing.T) {
+	gate := make(chan struct{})
+	state := newClaudeInputTokenState(
+		sdktranslator.FormatClaude,
+		sdktranslator.FormatOpenAI,
+		sdktranslator.FormatClaude,
+		[]byte(`{"messages":[{"role":"user","content":"Hello."}]}`),
+		gatedClaudeInputCodec{gate: gate, count: 4242},
+	)
+	messageStart := [][]byte{[]byte("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0}}}\n\n")}
+	if got := state.apply(context.Background(), messageStart); messageStartInputTokens(got) != 0 {
+		t.Fatalf("message_start input_tokens = %d, want unpatched 0 while estimate pending", messageStartInputTokens(got))
+	}
+	close(gate)
+
+	got := state.apply(context.Background(), [][]byte{[]byte("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n\n")})
+	if tokens := eventUsageInputTokens(got, "usage.input_tokens"); tokens != 4242 {
+		t.Fatalf("message_delta usage.input_tokens = %d, want late estimate 4242: %q", tokens, joinClaudeInputChunks(got))
+	}
+	if !state.handled {
+		t.Fatal("state.handled = false, want true after late estimate applied")
+	}
+}
+
+// A pending message_start must not abandon the rest of its element: the
+// terminal usage event on a later line is still evaluated, and a cancelled
+// context resolves it without a patch.
+func TestClaudeInputTokenStateTerminalUsageCancelsWithContext(t *testing.T) {
+	gate := make(chan struct{})
+	t.Cleanup(func() { close(gate) })
+	state := newClaudeInputTokenState(
+		sdktranslator.FormatClaude,
+		sdktranslator.FormatOpenAI,
+		sdktranslator.FormatClaude,
+		[]byte(`{"messages":[{"role":"user","content":"Hello."}]}`),
+		gatedClaudeInputCodec{gate: gate, count: 4242},
+	)
+	combined := [][]byte{[]byte("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0}}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n\n")}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	got := state.apply(ctx, combined)
+	if !state.handled {
+		t.Fatal("terminal usage event never reached after pending message_start")
+	}
+	if tokens := eventUsageInputTokens(got, "usage.input_tokens"); tokens != 0 {
+		t.Fatalf("cancelled estimate patched delta anyway: usage.input_tokens = %d", tokens)
+	}
+}
+
+// Cancelling while apply is parked in the terminal-usage wait releases the
+// hold without patching; the in-flight estimate is dropped, not awaited.
+func TestClaudeInputTokenStateCancelDuringActiveTerminalWait(t *testing.T) {
+	started := make(chan struct{})
+	gate := make(chan struct{})
+	t.Cleanup(func() { close(gate) })
+	state := newClaudeInputTokenState(
+		sdktranslator.FormatClaude,
+		sdktranslator.FormatOpenAI,
+		sdktranslator.FormatClaude,
+		[]byte(`{"messages":[{"role":"user","content":"Hello."}]}`),
+		gatedClaudeInputCodec{gate: gate, started: started, count: 4242},
+	)
+	combined := [][]byte{[]byte("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0}}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}\n\n")}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan [][]byte, 1)
+	go func() {
+		done <- state.apply(ctx, combined)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("estimate never started; cannot park in the terminal usage wait")
+	}
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case got := <-done:
+		if !state.handled {
+			t.Fatal("terminal usage event never reached")
+		}
+		if tokens := eventUsageInputTokens(got, "usage.input_tokens"); tokens != 0 {
+			t.Fatalf("cancelled estimate patched delta anyway: usage.input_tokens = %d", tokens)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ctx cancellation did not release the terminal usage wait")
+	}
+}
+
 func TestClaudeInputTokenStateCountErrorKeepsZero(t *testing.T) {
 	originalLogOutput := log.StandardLogger().Out
 	log.SetOutput(io.Discard)
 	defer log.SetOutput(originalLogOutput)
 
-	state := NewClaudeInputTokenState(
+	state := newClaudeInputTokenState(
 		sdktranslator.FormatClaude,
 		sdktranslator.FormatOpenAI,
 		sdktranslator.FormatClaude,
 		[]byte(`{"messages":[{"role":"user","content":"Hello."}]}`),
+		failingClaudeInputCodec{},
 	)
-	state.codec = failingClaudeInputCodec{}
+	drainClaudeInputEstimate(t, state)
 	chunks := [][]byte{[]byte("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0}}}\n\n")}
 
 	got := state.apply(context.Background(), chunks)
@@ -358,6 +512,7 @@ func TestClaudeInputTokenStateInvalidJSONKeepsZeroWithoutLoggingRequest(t *testi
 		sdktranslator.FormatClaude,
 		[]byte(sensitiveRequest),
 	)
+	drainClaudeInputEstimate(t, state)
 	chunks := [][]byte{[]byte("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0}}}\n\n")}
 
 	got := state.apply(context.Background(), chunks)
@@ -418,7 +573,22 @@ func TestClaudeInputTokenizerConcurrentCount(t *testing.T) {
 	}
 }
 
-func messageStartInputTokens(chunks [][]byte) int64 {
+// drainClaudeInputEstimate applies usage-less chunks until the background
+// estimate has been consumed, so tests can assert the patched event
+// deterministically regardless of tokenizer timing.
+func drainClaudeInputEstimate(t *testing.T, state *ClaudeInputTokenState) {
+	t.Helper()
+	ping := [][]byte{[]byte("data: {\"type\":\"ping\"}\n\n")}
+	deadline := time.Now().Add(5 * time.Second)
+	for !state.estimateReady {
+		if time.Now().After(deadline) {
+			t.Fatal("input token estimate did not complete")
+		}
+		state.apply(context.Background(), ping)
+	}
+}
+
+func eventUsageInputTokens(chunks [][]byte, usagePath string) int64 {
 	for _, chunk := range chunks {
 		for _, line := range strings.Split(string(chunk), "\n") {
 			trimmed := strings.TrimSpace(line)
@@ -426,12 +596,16 @@ func messageStartInputTokens(chunks [][]byte) int64 {
 				continue
 			}
 			payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
-			if gjson.Get(payload, "type").String() == "message_start" {
-				return gjson.Get(payload, "message.usage.input_tokens").Int()
+			if tokens := gjson.Get(payload, usagePath); tokens.Exists() {
+				return tokens.Int()
 			}
 		}
 	}
 	return 0
+}
+
+func messageStartInputTokens(chunks [][]byte) int64 {
+	return eventUsageInputTokens(chunks, "message.usage.input_tokens")
 }
 
 func joinClaudeInputChunks(chunks [][]byte) string {

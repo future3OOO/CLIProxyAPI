@@ -395,7 +395,9 @@ func convertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	}
 
 	// Handle user parameter (for tracking)
-	if user := root.Get("user"); user.Exists() {
+	// A top-level user applies only when no session identifier was forwarded;
+	// metadata.user_id carries the session id used for per-session state.
+	if user := root.Get("user"); user.Exists() && root.Get("metadata.user_id").String() == "" {
 		out, _ = sjson.SetBytes(out, "user", user.String())
 	}
 

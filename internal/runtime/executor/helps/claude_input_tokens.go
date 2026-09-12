@@ -33,6 +33,11 @@ type ClaudeInputTokenState struct {
 	// setup so the full-request BPE pass overlaps the upstream call instead of
 	// blocking the first client byte.
 	estimateCh chan claudeInputEstimate
+	// estimateResult/estimateReady buffer the drained result so a still-running
+	// estimate never delays a client-bound chunk; the correction lands on the
+	// next usage-bearing event once it resolves.
+	estimateResult claudeInputEstimate
+	estimateReady  bool
 }
 
 type claudeInputEstimate struct {
@@ -42,6 +47,13 @@ type claudeInputEstimate struct {
 
 // NewClaudeInputTokenState creates request-scoped state for translated Claude input token usage.
 func NewClaudeInputTokenState(sourceFormat, upstreamFormat, responseFormat sdktranslator.Format, originalRequest []byte) *ClaudeInputTokenState {
+	return newClaudeInputTokenState(sourceFormat, upstreamFormat, responseFormat, originalRequest, nil)
+}
+
+// newClaudeInputTokenState accepts the codec up front so tests can inject a
+// failing codec before the estimate goroutine launches; writing state.codec
+// after construction races that goroutine.
+func newClaudeInputTokenState(sourceFormat, upstreamFormat, responseFormat sdktranslator.Format, originalRequest []byte, codec tokenizer.Codec) *ClaudeInputTokenState {
 	enabled := sourceFormat == sdktranslator.FormatClaude &&
 		upstreamFormat != sdktranslator.FormatClaude &&
 		responseFormat == sdktranslator.FormatClaude
@@ -49,6 +61,7 @@ func NewClaudeInputTokenState(sourceFormat, upstreamFormat, responseFormat sdktr
 		upstreamFormat:  upstreamFormat,
 		responseFormat:  responseFormat,
 		originalRequest: originalRequest,
+		codec:           codec,
 		handled:         !enabled,
 	}
 	if enabled {
@@ -320,6 +333,13 @@ func (state *ClaudeInputTokenState) apply(ctx context.Context, chunks [][]byte) 
 }
 
 func (state *ClaudeInputTokenState) applyChunk(ctx context.Context, chunk []byte) ([]byte, bool) {
+	if !state.estimateReady {
+		select {
+		case state.estimateResult = <-state.estimateCh:
+			state.estimateReady = true
+		default:
+		}
+	}
 	for lineStart := 0; lineStart < len(chunk); {
 		lineEnd := bytes.IndexByte(chunk[lineStart:], '\n')
 		if lineEnd < 0 {
@@ -344,32 +364,58 @@ func (state *ClaudeInputTokenState) applyChunk(ctx context.Context, chunk []byte
 				payloadEnd--
 			}
 			payload := line[payloadOffset:payloadEnd]
-			if gjson.GetBytes(payload, "type").String() == "message_start" {
-				inputTokens := gjson.GetBytes(payload, "message.usage.input_tokens")
+			var usagePath string
+			terminalUsage := false
+			switch gjson.GetBytes(payload, "type").String() {
+			case "message_start":
+				usagePath = "message.usage"
+			case "message_delta":
+				// Only merge into a usage object the upstream actually sent;
+				// message_delta usage is a cumulative snapshot.
+				if gjson.GetBytes(payload, "usage").Exists() {
+					usagePath = "usage"
+					terminalUsage = true
+				}
+			}
+			if usagePath != "" {
+				inputTokens := gjson.GetBytes(payload, usagePath+".input_tokens")
 				if inputTokens.Exists() && inputTokens.Int() != 0 {
 					return chunk, true
 				}
-				est := <-state.estimateCh
-				if est.err != nil {
-					state.logEstimateError(ctx, est.err)
-					return chunk, true
+				if !state.estimateReady && terminalUsage {
+					// Earlier events already went out unpatched, so wait for the
+					// in-flight estimate instead of dropping the correction.
+					select {
+					case state.estimateResult = <-state.estimateCh:
+						state.estimateReady = true
+					case <-ctx.Done():
+						return chunk, true
+					}
 				}
-				count := est.count
-				if count == 0 {
-					return chunk, true
+				if state.estimateReady {
+					if state.estimateResult.err != nil {
+						state.logEstimateError(ctx, state.estimateResult.err)
+						return chunk, true
+					}
+					count := state.estimateResult.count
+					if count == 0 {
+						return chunk, true
+					}
+					updatedPayload, errSet := sjson.SetBytes(payload, usagePath+".input_tokens", count)
+					if errSet != nil {
+						state.logEstimateError(ctx, fmt.Errorf("set input token usage: %w", errSet))
+						return chunk, true
+					}
+					payloadStart := lineStart + payloadOffset
+					payloadStop := lineStart + payloadEnd
+					updated := make([]byte, 0, len(chunk)+len(updatedPayload)-len(payload))
+					updated = append(updated, chunk[:payloadStart]...)
+					updated = append(updated, updatedPayload...)
+					updated = append(updated, chunk[payloadStop:]...)
+					return updated, true
 				}
-				updatedPayload, errSet := sjson.SetBytes(payload, "message.usage.input_tokens", count)
-				if errSet != nil {
-					state.logEstimateError(ctx, fmt.Errorf("set message_start usage: %w", errSet))
-					return chunk, true
-				}
-				payloadStart := lineStart + payloadOffset
-				payloadStop := lineStart + payloadEnd
-				updated := make([]byte, 0, len(chunk)+len(updatedPayload)-len(payload))
-				updated = append(updated, chunk[:payloadStart]...)
-				updated = append(updated, updatedPayload...)
-				updated = append(updated, chunk[payloadStop:]...)
-				return updated, true
+				// Estimate still pending on a non-terminal usage event: leave the
+				// event unpatched and keep scanning for a later usage-bearing line.
 			}
 		}
 
