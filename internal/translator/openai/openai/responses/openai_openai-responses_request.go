@@ -70,7 +70,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 		outputCallIDs := make(map[string]struct{})
 		for _, item := range inputItems {
 			itemType := item.Get("type").String()
-			if itemType != "function_call_output" && itemType != "custom_tool_call_output" {
+			if itemType != "function_call_output" && itemType != "custom_tool_call_output" && itemType != "tool_search_output" {
 				continue
 			}
 			callID := translatorcommon.ExtractResponsesCallID(item)
@@ -169,7 +169,7 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 			if itemType == "" && item.Get("role").String() != "" {
 				itemType = "message"
 			}
-			if itemType != "function_call" && itemType != "custom_tool_call" {
+			if itemType != "function_call" && itemType != "custom_tool_call" && itemType != "tool_search_call" {
 				flushPendingToolCalls()
 			}
 
@@ -311,6 +311,74 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 				if output := item.Get("output"); output.Exists() {
 					toolMessage = setCustomToolCallOutputContent(toolMessage, output)
 				}
+				appendMessage(toolMessage)
+				if len(awaitingToolOutputs) == 0 && len(deferredMessages) > 0 {
+					flushDeferredMessages()
+				}
+
+			case "tool_search_call":
+				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, item.Get("reasoning_content").String())
+				// Hosted tool call replay: tool_search arrives back as a call
+				// item whose arguments are already a JSON object.
+				toolCall := []byte(`{"id":"","type":"function","function":{"name":"tool_search","arguments":""}}`)
+				callID := translatorcommon.ExtractResponsesCallID(item)
+				if callID != "" {
+					toolCall, _ = sjson.SetBytes(toolCall, "id", callID)
+				}
+				if arguments := item.Get("arguments"); arguments.Exists() {
+					args := arguments.Raw
+					if arguments.Type == gjson.String {
+						args = arguments.String()
+					}
+					toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", args)
+				}
+				pendingToolCalls = append(pendingToolCalls, gjson.ParseBytes(toolCall).Value())
+				if callID != "" {
+					pendingToolCallIDs = append(pendingToolCallIDs, callID)
+				}
+
+			case "tool_search_output":
+				mergeableAssistantIndex = -1
+				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
+				callID := translatorcommon.ExtractResponsesCallID(item)
+				if callID != "" {
+					toolMessage, _ = sjson.SetBytes(toolMessage, "tool_call_id", callID)
+					delete(awaitingToolOutputs, callID)
+				}
+				if tools := item.Get("tools"); tools.Exists() {
+					toolMessage, _ = sjson.SetBytes(toolMessage, "content", tools.Raw)
+				}
+				appendMessage(toolMessage)
+				if len(awaitingToolOutputs) == 0 && len(deferredMessages) > 0 {
+					flushDeferredMessages()
+				}
+
+			case "web_search_call":
+				mergeableAssistantIndex = -1
+				// Web searches produce no output item in Responses history;
+				// replay as a call plus a minimal synthesized acknowledgement
+				// so strict call->output adjacency holds for the chat side.
+				toolCall := []byte(`{"id":"","type":"function","function":{"name":"web_search","arguments":""}}`)
+				callID := translatorcommon.ExtractResponsesCallID(item)
+				if callID == "" {
+					callID = item.Get("id").String()
+				}
+				if callID != "" {
+					toolCall, _ = sjson.SetBytes(toolCall, "id", callID)
+				}
+				args := []byte(`{}`)
+				if query := item.Get("action.query"); query.Exists() {
+					args, _ = sjson.SetBytes(args, "query", query.String())
+				}
+				toolCall, _ = sjson.SetBytes(toolCall, "function.arguments", string(args))
+				pendingToolCalls = append(pendingToolCalls, gjson.ParseBytes(toolCall).Value())
+				flushPendingToolCalls()
+				toolMessage := []byte(`{"role":"tool","tool_call_id":"","content":""}`)
+				if callID != "" {
+					toolMessage, _ = sjson.SetBytes(toolMessage, "tool_call_id", callID)
+					delete(awaitingToolOutputs, callID)
+				}
+				toolMessage, _ = sjson.SetBytes(toolMessage, "content", `{"status":"completed"}`)
 				appendMessage(toolMessage)
 				if len(awaitingToolOutputs) == 0 && len(deferredMessages) > 0 {
 					flushDeferredMessages()

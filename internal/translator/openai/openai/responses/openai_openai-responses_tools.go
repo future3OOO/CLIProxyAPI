@@ -18,6 +18,8 @@ type responsesToolDeclaration struct {
 	localName string
 	namespace string
 	custom    bool
+	hosted    bool
+	execution string
 }
 
 // walkResponsesToolDeclarations visits the tool declarations of a Responses
@@ -35,17 +37,25 @@ func walkResponsesToolDeclarations(root gjson.Result, visit func(responsesToolDe
 		if !proceed {
 			return
 		}
-		var custom bool
-		switch strings.TrimSpace(tool.Get("type").String()) {
+		var custom, hosted bool
+		toolType := strings.TrimSpace(tool.Get("type").String())
+		switch toolType {
 		case "", "function":
 		case "custom":
 			custom = true
+		case "tool_search", "web_search":
+			hosted = true
 		default:
 			return
 		}
 		localName := responsesToolName(tool)
 		if localName == "" {
-			return
+			// Hosted tool declarations carry no name; the wire type is the
+			// callable identity Codex dispatches on.
+			if !hosted {
+				return
+			}
+			localName = toolType
 		}
 		proceed = visit(responsesToolDeclaration{
 			tool:      tool,
@@ -53,6 +63,8 @@ func walkResponsesToolDeclarations(root gjson.Result, visit func(responsesToolDe
 			localName: localName,
 			namespace: namespaceName,
 			custom:    custom,
+			hosted:    hosted,
+			execution: strings.TrimSpace(tool.Get("execution").String()),
 		})
 	}
 	scan := func(tools gjson.Result) {
@@ -78,7 +90,11 @@ func walkResponsesToolDeclarations(root gjson.Result, visit func(responsesToolDe
 	scan(root.Get("tools"))
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("type").String() == "additional_tools" {
+			// additional_tools is Codex Desktop's delivery channel;
+			// tool_search_output carries tools the client exposed after a
+			// discovery call — both must reach the declared chat tool list or
+			// the model can never emit calls for them.
+			if t := item.Get("type").String(); t == "additional_tools" || t == "tool_search_output" {
 				scan(item.Get("tools"))
 			}
 			return proceed
@@ -106,6 +122,8 @@ func mergeResponsesRequestChatTools(root gjson.Result) [][]byte {
 		convert := convertResponsesFunctionToolToOpenAIChat
 		if declaration.custom {
 			convert = convertResponsesCustomToolToOpenAIChat
+		} else if declaration.hosted {
+			convert = convertResponsesHostedToolToOpenAIChat
 		}
 		if chatTool, ok := convert(declaration.tool, declaration.chatName); ok {
 			seenToolNames[declaration.chatName] = struct{}{}
@@ -132,6 +150,41 @@ func convertResponsesCustomToolToOpenAIChat(tool gjson.Result, overrideName stri
 	if description := responsesToolDescription(tool); description != "" {
 		chatTool, _ = sjson.SetBytes(chatTool, "function.description", description)
 	}
+	return chatTool, true
+}
+
+// convertResponsesHostedToolToOpenAIChat maps Codex client-executed hosted
+// tools (tool_search, web_search) onto Chat Completions function tools. Their
+// declarations carry no parameters schema, so a per-type minimal schema is
+// supplied; response translation maps calls back to the original item types.
+func convertResponsesHostedToolToOpenAIChat(tool gjson.Result, overrideName string) ([]byte, bool) {
+	name := strings.TrimSpace(overrideName)
+	if name == "" {
+		name = responsesToolName(tool)
+	}
+	if name == "" {
+		name = strings.TrimSpace(tool.Get("type").String())
+	}
+	if name == "" {
+		return nil, false
+	}
+
+	parameters := `{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`
+	if tool.Get("type").String() == "tool_search" {
+		parameters = `{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}`
+	}
+	if declared := responsesToolParameters(tool); declared.Exists() {
+		parameters = declared.Raw
+	}
+
+	chatTool := []byte(`{"type":"function","function":{"name":"","description":"","parameters":{}}}`)
+	chatTool, _ = sjson.SetBytes(chatTool, "function.name", name)
+	if description := responsesToolDescription(tool); description != "" {
+		chatTool, _ = sjson.SetBytes(chatTool, "function.description", description)
+	} else {
+		chatTool, _ = sjson.SetBytes(chatTool, "function.description", "Search the web for current information.")
+	}
+	chatTool, _ = sjson.SetRawBytes(chatTool, "function.parameters", []byte(parameters))
 	return chatTool, true
 }
 
@@ -234,6 +287,36 @@ func responsesCustomToolNames(requestRawJSON []byte) map[string]struct{} {
 		return true
 	})
 	return names
+}
+
+// hostedToolKind records a client-executed hosted tool declaration so response
+// translation can restore the original Responses item type (tool_search_call,
+// web_search_call) for calls emitted as plain chat function calls.
+type hostedToolKind struct {
+	wireType  string
+	execution string
+}
+
+// responsesHostedToolKinds collects the Chat Completions names of hosted tools
+// that survive the merge, following the same first-wins dedup rule as
+// responsesCustomToolNames.
+func responsesHostedToolKinds(requestRawJSON []byte) map[string]hostedToolKind {
+	kinds := make(map[string]hostedToolKind)
+	seenToolNames := make(map[string]struct{})
+	walkResponsesToolDeclarations(gjson.ParseBytes(requestRawJSON), func(declaration responsesToolDeclaration) bool {
+		if _, duplicate := seenToolNames[declaration.chatName]; duplicate {
+			return true
+		}
+		seenToolNames[declaration.chatName] = struct{}{}
+		if declaration.hosted {
+			kinds[declaration.chatName] = hostedToolKind{
+				wireType:  strings.TrimSpace(declaration.tool.Get("type").String()),
+				execution: declaration.execution,
+			}
+		}
+		return true
+	})
+	return kinds
 }
 
 func responsesSingleCustomToolName(requestRawJSON []byte) (string, bool) {

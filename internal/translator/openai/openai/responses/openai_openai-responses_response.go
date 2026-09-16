@@ -51,7 +51,11 @@ type oaiToResponsesState struct {
 	// names of freeform ("custom") tools from the original request; calls to
 	// these are emitted as custom_tool_call items instead of function_call
 	CustomToolNames map[string]struct{}
-	FinishReason    string
+	// hosted tools (tool_search, web_search) declared in the original request;
+	// calls to these restore their original Responses item types
+	HostedTools    map[string]hostedToolKind
+	FuncItemHosted map[string]hostedToolKind
+	FinishReason   string
 	// usage aggregation
 	PromptTokens     int64
 	CachedTokens     int64
@@ -59,6 +63,44 @@ type oaiToResponsesState struct {
 	TotalTokens      int64
 	ReasoningTokens  int64
 	UsageSeen        bool
+}
+
+// responsesHostedItemIDPrefix returns the Responses item id prefix Codex uses
+// for a hosted tool call item ("tsc" for tool_search_call, "ws" for
+// web_search_call, matching codex protocol models).
+func responsesHostedItemIDPrefix(wireType string) string {
+	if wireType == "tool_search" {
+		return "tsc"
+	}
+	return "ws"
+}
+
+// buildResponsesHostedToolItem reconstructs the original Responses output item
+// for a client-executed hosted tool call. tool_search_call carries object
+// arguments and the declared execution mode; web_search_call carries the
+// action block Codex replays.
+func buildResponsesHostedToolItem(kind hostedToolKind, callID, status, args string) []byte {
+	if kind.wireType == "tool_search" {
+		item := []byte(`{"id":"","type":"tool_search_call","status":"completed","call_id":"","execution":"client","arguments":{}}`)
+		item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("tsc_%s", callID))
+		item, _ = sjson.SetBytes(item, "status", status)
+		item, _ = sjson.SetBytes(item, "call_id", callID)
+		if kind.execution != "" {
+			item, _ = sjson.SetBytes(item, "execution", kind.execution)
+		}
+		if parsed := gjson.Parse(args); parsed.IsObject() {
+			item, _ = sjson.SetRawBytes(item, "arguments", []byte(parsed.Raw))
+		}
+		return item
+	}
+	item := []byte(`{"id":"","type":"web_search_call","status":"completed"}`)
+	item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("ws_%s", callID))
+	item, _ = sjson.SetBytes(item, "status", status)
+	if query := gjson.Get(args, "query"); query.Exists() {
+		item, _ = sjson.SetBytes(item, "action.type", "search")
+		item, _ = sjson.SetBytes(item, "action.query", query.String())
+	}
+	return item
 }
 
 // responseIDCounter provides a process-wide unique counter for synthesized response identifiers.
@@ -207,6 +249,11 @@ func buildResponsesCompletedEvent(st *oaiToResponsesState, requestRawJSON []byte
 			if _, isInc := incompleteByFinishReason(st.FinishReason); isInc {
 				toolStatus = "incomplete"
 			}
+			if hostedKind, isHostedTool := st.FuncItemHosted[key]; isHostedTool {
+				item := buildResponsesHostedToolItem(hostedKind, callID, toolStatus, args)
+				outputItems = append(outputItems, completedOutputItem{index: st.FuncOutputIx[key], raw: item})
+				continue
+			}
 			if st.FuncItemCustom[key] {
 				item := []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)
 				item, _ = sjson.SetBytes(item, "id", fmt.Sprintf("ctc_%s", callID))
@@ -267,6 +314,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 			MsgItemDone:     make(map[int]bool),
 			FuncItemAdded:   make(map[string]bool),
 			FuncItemCustom:  make(map[string]bool),
+			FuncItemHosted:  make(map[string]hostedToolKind),
 			FuncArgsDone:    make(map[string]bool),
 			FuncItemDone:    make(map[string]bool),
 			Reasonings:      make([]oaiToResponsesStateReasoning, 0),
@@ -360,6 +408,26 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		outputIndex := st.FuncOutputIx[key]
 		_, isCustomTool := st.CustomToolNames[name]
 		st.FuncItemCustom[key] = isCustomTool
+		if hostedKind, isHostedTool := st.HostedTools[name]; isHostedTool && !isCustomTool {
+			st.FuncItemHosted[key] = hostedKind
+			var o []byte
+			switch hostedKind.wireType {
+			case "tool_search":
+				o = []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"tool_search_call","status":"in_progress","call_id":"","execution":"client","arguments":{}}}`)
+				o, _ = sjson.SetBytes(o, "item.execution", hostedKind.execution)
+			default: // web_search
+				o = []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"web_search_call","status":"in_progress"}}`)
+			}
+			o, _ = sjson.SetBytes(o, "sequence_number", nextSeq())
+			o, _ = sjson.SetBytes(o, "output_index", outputIndex)
+			o, _ = sjson.SetBytes(o, "item.id", fmt.Sprintf("%s_%s", responsesHostedItemIDPrefix(hostedKind.wireType), callID))
+			if hostedKind.wireType == "tool_search" {
+				o, _ = sjson.SetBytes(o, "item.call_id", callID)
+			}
+			out = append(out, emitRespEvent("response.output_item.added", o))
+			st.FuncItemAdded[key] = true
+			return
+		}
 		if isCustomTool {
 			o := []byte(`{"type":"response.output_item.added","sequence_number":0,"output_index":0,"item":{"id":"","type":"custom_tool_call","status":"in_progress","input":"","call_id":"","name":""}}`)
 			o, _ = sjson.SetBytes(o, "sequence_number", nextSeq())
@@ -381,6 +449,9 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 	}
 	emitPendingFunctionArgs := func(key string) {
 		if !st.FuncItemAdded[key] || st.FuncItemCustom[key] {
+			return
+		}
+		if _, isHostedTool := st.FuncItemHosted[key]; isHostedTool {
 			return
 		}
 		argsBuf := st.FuncArgsBuf[key]
@@ -419,9 +490,11 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 		st.MsgItemDone = make(map[int]bool)
 		st.FuncItemAdded = make(map[string]bool)
 		st.FuncItemCustom = make(map[string]bool)
+		st.FuncItemHosted = make(map[string]hostedToolKind)
 		st.FuncArgsDone = make(map[string]bool)
 		st.FuncItemDone = make(map[string]bool)
 		st.CustomToolNames = responsesCustomToolNames(requestForNamespace)
+		st.HostedTools = responsesHostedToolKinds(requestForNamespace)
 		st.PromptTokens = 0
 		st.CachedTokens = 0
 		st.CompletionTokens = 0
@@ -583,6 +656,17 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponses(ctx context.Context, 
 				toolStatus = "incomplete"
 			}
 
+			if hostedKind, isHostedTool := st.FuncItemHosted[key]; isHostedTool {
+				inner := buildResponsesHostedToolItem(hostedKind, callID, toolStatus, args)
+				itemDone := []byte(`{"type":"response.output_item.done","sequence_number":0,"output_index":0,"item":{}}`)
+				itemDone, _ = sjson.SetBytes(itemDone, "sequence_number", nextSeq())
+				itemDone, _ = sjson.SetBytes(itemDone, "output_index", outputIndex)
+				itemDone, _ = sjson.SetRawBytes(itemDone, "item", inner)
+				out = append(out, emitRespEvent("response.output_item.done", itemDone))
+				st.FuncItemDone[key] = true
+				st.FuncArgsDone[key] = true
+				continue
+			}
 			if st.FuncItemCustom[key] {
 				input := unwrapCustomToolInput(args)
 				inputDone := []byte(`{"type":"response.custom_tool_call_input.done","sequence_number":0,"item_id":"","output_index":0,"input":""}`)
@@ -932,6 +1016,7 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 				// Function/tool calls
 				if tcs := msg.Get("tool_calls"); tcs.Exists() && tcs.IsArray() {
 					customToolNames := responsesCustomToolNames(requestForNamespace)
+					hostedKinds := responsesHostedToolKinds(requestForNamespace)
 					tcs.ForEach(func(tcIndex, tc gjson.Result) bool {
 						callID := tc.Get("id").String()
 						if callID == "" {
@@ -944,6 +1029,10 @@ func ConvertOpenAIChatCompletionsResponseToOpenAIResponsesNonStream(_ context.Co
 						toolStatus := "completed"
 						if isIncomplete {
 							toolStatus = "incomplete"
+						}
+						if hostedKind, isHostedTool := hostedKinds[name]; isHostedTool {
+							outputItems = append(outputItems, buildResponsesHostedToolItem(hostedKind, callID, toolStatus, args))
+							return true
 						}
 						if _, isCustomTool := customToolNames[name]; isCustomTool {
 							item := []byte(`{"id":"","type":"custom_tool_call","status":"completed","input":"","call_id":"","name":""}`)
