@@ -229,6 +229,30 @@ func ConvertOpenAIResponsesRequestToOpenAIChatCompletions(modelName string, inpu
 					mergeableAssistantIndex = messageIndex
 				}
 
+			case "agent_message":
+				// Inter-agent mail (spawn_agent/send_message/followup_task envelopes).
+				// The harness carries the payload in an encrypted_content part as
+				// plaintext task text; without this case the whole item — envelope
+				// and payload — was silently dropped, so sub-agents received empty
+				// tasks and hallucinated work.
+				mergeableAssistantIndex = -1
+				appendPendingReasoningMessage()
+				var text strings.Builder
+				if content := item.Get("content"); content.Exists() && content.IsArray() {
+					content.ForEach(func(_, contentItem gjson.Result) bool {
+						switch contentItem.Get("type").String() {
+						case "text", "input_text", "output_text":
+							text.WriteString(contentItem.Get("text").String())
+						case "encrypted_content":
+							text.WriteString(contentItem.Get("encrypted_content").String())
+						}
+						return true
+					})
+				}
+				message := []byte(`{"role":"user","content":[{"type":"text","text":""}]}`)
+				message, _ = sjson.SetBytes(message, "content.0.text", text.String())
+				appendRegularMessage(message)
+
 			case "reasoning":
 				reasoningContent := collectOpenAIResponsesReasoningContent(item)
 				pendingReasoningContent = combineOpenAIResponsesReasoning(pendingReasoningContent, reasoningContent)
