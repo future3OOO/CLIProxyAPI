@@ -846,6 +846,19 @@ nonstream-keepalive-interval: 0
 #       params: # JSON path (gjson/sjson syntax) -> raw JSON value (strings are used as-is, must be valid JSON)
 #         "generationConfig.responseJsonSchema": "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"string\"}}}"
 #   override: # Override rules always set parameters, overwriting any existing values.
+#     # Codex speed tier. "priority" is the wire id of the tier Codex displays as "Fast";
+#     # the literal "fast" is rejected upstream with 400 "Unsupported service_tier: fast".
+#     # Override rules run after protocol translation, so the value set here is sent verbatim.
+#     # Claude-protocol clients do not need this rule at all: sending "service_tier": "fast"
+#     # (or "speed": "fast") in the request body is already normalized to "priority".
+#     # This rule is for clients that can only choose a model name. The names below are
+#     # client-visible aliases and do not exist by default. Create them with oauth-model-alias
+#     # for OAuth credentials, or with the per-credential "models" alias for codex-api-key:
+#     #   oauth-model-alias:
+#     #     codex:
+#     #       - name: "gpt-5.5"     # upstream model name
+#     #         alias: "gpt-5.5-fast" # client-visible name matched by the rule below
+#     #         fork: true          # keep "gpt-5.5" listed as well
 #     - models:
 #         - name: "gpt-5.4-fast"
 #           protocol: "codex"

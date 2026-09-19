@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -1247,6 +1248,43 @@ func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_MixedMissingAndExp
 	}
 	if got := resultMap["call_b"]; got != "result_b" {
 		t.Fatalf("result for call_b = %q, want result_b", got)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToOpenAIChatCompletions_RendersAgentMessagePayload(t *testing.T) {
+	raw := []byte(`{
+		"input": [
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"orient"}]},
+			{"type":"agent_message","author":"/root","recipient":"/root/rev","content":[
+				{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/rev\nSender: /root\nPayload:\n"},
+				{"type":"encrypted_content","encrypted_content":"review the diff"}
+			]},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}
+		]
+	}`)
+	t.Logf("input json:\n%s", prettyJSONForTest(raw))
+
+	out := ConvertOpenAIResponsesRequestToOpenAIChatCompletions("swe-2-max", raw, true)
+	t.Logf("output json:\n%s", prettyJSONForTest(out))
+
+	msgs := gjson.GetBytes(out, "messages")
+	if !msgs.Exists() || !msgs.IsArray() {
+		t.Fatalf("messages should be an array")
+	}
+	if got := len(msgs.Array()); got != 3 {
+		t.Fatalf("messages count = %d, want %d", got, 3)
+	}
+
+	if got := gjson.GetBytes(out, "messages.1.role").String(); got != "user" {
+		t.Fatalf("messages.1.role = %q, want %q", got, "user")
+	}
+	text := gjson.GetBytes(out, "messages.1.content.0.text").String()
+	if !strings.Contains(text, "Message Type: NEW_TASK") || !strings.Contains(text, "Payload:\nreview the diff") {
+		t.Fatalf("agent_message text = %q, want envelope plus payload", text)
+	}
+
+	if got := gjson.GetBytes(out, "messages.2.role").String(); got != "assistant" {
+		t.Fatalf("messages.2.role = %q, want %q", got, "assistant")
 	}
 }
 
