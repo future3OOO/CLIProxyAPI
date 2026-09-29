@@ -584,7 +584,7 @@ func TestClaudeCloakedToolContinuationPreservesExplicitPromptID(t *testing.T) {
 	turn1Payload := []byte(`{
 		"model": "claude-opus-5",
 		"system": [
-			{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.258.000; cc_entrypoint=cli; cch=00000; cc_prompt_id=` + explicitUUID + `;"}
+			{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.280.000; cc_entrypoint=cli; cch=00000; cc_prompt_id=` + explicitUUID + `;"}
 		],
 		"messages": [{"role": "user", "content": "run tool"}]
 	}`)
