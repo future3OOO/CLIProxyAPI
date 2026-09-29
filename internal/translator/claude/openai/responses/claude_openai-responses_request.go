@@ -427,7 +427,10 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		case "reasoning":
 			appendReasoning(convertResponsesReasoningToClaudeThinking(item, preserveEmptyThinkingBlocks))
 
-		case "function_call", "custom_tool_call":
+		case "function_call", "custom_tool_call", "tool_search_call":
+			if typ == "tool_search_call" && !isResponsesClientToolSearch(item) {
+				break
+			}
 			// Map to assistant tool_use. Freeform custom input is wrapped in an
 			// object because Claude tool_use input must be a JSON object.
 			callID := common.ExtractResponsesCallID(item)
@@ -436,6 +439,9 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			}
 			callID = util.SanitizeClaudeToolID(callID)
 			name := item.Get("name").String()
+			if typ == "tool_search_call" {
+				name = responsesToolSearchName
+			}
 			if namespaceName := strings.TrimSpace(item.Get("namespace").String()); namespaceName != "" {
 				// Rebuild the qualified name emitted by the previous Responses turn.
 				name = qualifyResponsesNamespaceToolName(namespaceName, name)
@@ -459,7 +465,10 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 
 			appendToolUse(toolUse)
 
-		case "function_call_output", "custom_tool_call_output":
+		case "function_call_output", "custom_tool_call_output", "tool_search_output":
+			if typ == "tool_search_output" && !isResponsesClientToolSearch(item) {
+				break
+			}
 			// Map to user tool_result
 			rawID := common.ExtractResponsesCallID(item)
 			callID := util.SanitizeClaudeToolID(rawID)
@@ -477,7 +486,13 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 			}
 			toolResult := []byte(`{"type":"tool_result","tool_use_id":"","content":""}`)
 			toolResult, _ = sjson.SetBytes(toolResult, "tool_use_id", callID)
-			toolResult = applyResponsesToolResultContent(toolResult, output)
+			if typ == "tool_search_output" {
+				// The loaded tools themselves are declared through
+				// responsesToolSources; the result tells the model their names.
+				toolResult, _ = sjson.SetBytes(toolResult, "content", "Loaded tools: "+strings.Join(responsesLoadedToolNames(item.Get("tools")), ", "))
+			} else {
+				toolResult = applyResponsesToolResultContent(toolResult, output)
+			}
 
 			appendParts("user", toolResult)
 
@@ -882,8 +897,24 @@ func convertResponsesContentPartToClaude(part gjson.Result) []byte {
 	return nil
 }
 
-func isOpenAIResponsesApplyPatchCustomTool(toolType string, tool gjson.Result) bool {
-	return toolType == "custom" && strings.TrimSpace(tool.Get("name").String()) == "apply_patch"
+// responsesToolSearchName is the Claude tool name for the client-executed
+// Responses tool_search tool, which carries no name of its own.
+const responsesToolSearchName = "tool_search"
+
+// isResponsesClientToolSearch reports whether a tool_search declaration, call
+// or output is client-executed; server-executed search is not translated.
+func isResponsesClientToolSearch(item gjson.Result) bool {
+	return item.Get("execution").String() == "client"
+}
+
+// responsesLoadedToolNames lists the Claude names of the tools a
+// tool_search_output loaded.
+func responsesLoadedToolNames(tools gjson.Result) []string {
+	var names []string
+	for _, descriptor := range responsesToolDescriptors(gjson.Parse(`{"tools":` + tools.Raw + `}`)) {
+		names = append(names, descriptor.name)
+	}
+	return names
 }
 
 func convertResponsesToolDescriptorToClaude(descriptor responsesToolDescriptor) ([]byte, bool) {
@@ -894,6 +925,8 @@ func convertResponsesToolDescriptorToClaude(descriptor responsesToolDescriptor) 
 	switch descriptor.toolType {
 	case "function":
 		return convertResponsesFunctionToolToClaude(descriptor.tool, overrideName)
+	case "tool_search":
+		return convertResponsesFunctionToolToClaude(descriptor.tool, responsesToolSearchName)
 	case "custom":
 		return convertResponsesCustomToolToClaude(descriptor.tool, overrideName)
 	case "web_search":
@@ -911,7 +944,7 @@ func convertResponsesToolDescriptorToClaude(descriptor responsesToolDescriptor) 
 
 type responsesToolSource struct {
 	tools    gjson.Result
-	priority int // Top-level tools use 0; all additional_tools sources use 1.
+	priority int // Top-level tools use 0; additional_tools and tool_search_output sources use 1.
 }
 
 func responsesToolSources(root gjson.Result) []responsesToolSource {
@@ -925,8 +958,15 @@ func responsesToolSources(root gjson.Result) []responsesToolSource {
 	appendSource(root.Get("tools"), 0)
 	if input := root.Get("input"); input.Exists() && input.IsArray() {
 		input.ForEach(func(_, item gjson.Result) bool {
-			if item.Get("type").String() == "additional_tools" {
+			// Codex declares tools loaded by a client tool_search only inside
+			// its tool_search_output, never again in the top-level tools.
+			switch item.Get("type").String() {
+			case "additional_tools":
 				appendSource(item.Get("tools"), 1)
+			case "tool_search_output":
+				if isResponsesClientToolSearch(item) {
+					appendSource(item.Get("tools"), 1)
+				}
 			}
 			return true
 		})
@@ -978,9 +1018,7 @@ func responsesToolDescriptors(root gjson.Result) []responsesToolDescriptor {
 			case "", "function":
 				appendDescriptor(child, qualifiedName, childName, namespaceName, "function", sourcePriority, false)
 			case "custom":
-				if !isOpenAIResponsesApplyPatchCustomTool("custom", child) {
-					appendDescriptor(child, qualifiedName, childName, namespaceName, "custom", sourcePriority, false)
-				}
+				appendDescriptor(child, qualifiedName, childName, namespaceName, "custom", sourcePriority, false)
 			}
 			return true
 		})
@@ -992,8 +1030,10 @@ func responsesToolDescriptors(root gjson.Result) []responsesToolDescriptor {
 			case "", "function":
 				appendDescriptor(tool, responsesToolName(tool), "", "", "function", source.priority, true)
 			case "custom":
-				if !isOpenAIResponsesApplyPatchCustomTool("custom", tool) {
-					appendDescriptor(tool, responsesToolName(tool), "", "", "custom", source.priority, true)
+				appendDescriptor(tool, responsesToolName(tool), "", "", "custom", source.priority, true)
+			case "tool_search":
+				if isResponsesClientToolSearch(tool) {
+					appendDescriptor(tool, responsesToolSearchName, "", "", "tool_search", source.priority, true)
 				}
 			case "namespace":
 				appendNamespaceChildren(tool, source.priority)
@@ -1196,7 +1236,12 @@ func convertResponsesCustomToolToClaude(tool gjson.Result, overrideName string) 
 
 	tJSON := []byte(`{"name":"","description":"","input_schema":{"type":"object","properties":{"input":{"type":"string"}},"required":["input"]}}`)
 	tJSON, _ = sjson.SetBytes(tJSON, "name", name)
-	if description := responsesToolDescription(tool); description != "" {
+	description := responsesToolDescription(tool)
+	if grammar := tool.Get("format.definition").String(); tool.Get("format.type").String() == "grammar" && grammar != "" {
+		// Claude cannot enforce a freeform grammar; state it so the input matches.
+		description += "\n\nThe input must match this " + tool.Get("format.syntax").String() + " grammar:\n" + grammar
+	}
+	if description != "" {
 		tJSON, _ = sjson.SetBytes(tJSON, "description", description)
 	}
 	tJSON = common.AttachCacheControl(tJSON, tool)
